@@ -1,6 +1,6 @@
 import type { NextConfig } from 'next';
 
-const rawApiOrigin = process.env.INTERNAL_API_URL || 'http://127.0.0.1:4000';
+const rawApiOrigin = (process.env.INTERNAL_API_URL || 'http://127.0.0.1:4000').trim().replace(/\/+$/, '');
 const internalApiOrigin = /^https?:\/\//i.test(rawApiOrigin) ? rawApiOrigin : `http://${rawApiOrigin}`;
 
 const nextConfig: NextConfig = {

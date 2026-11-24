@@ -91,8 +91,63 @@ export class DocumentsService {
     this.storage.verifyLocalDownloadSignature(documentId, expUnix, sig);
     const doc = await this.prisma.document.findUnique({ where: { id: documentId } });
     if (!doc) throw new NotFoundException('Document not found.');
-    const buffer = await this.storage.readLocalPrivateObject(doc.storageKey);
-    return { doc, buffer };
+    try {
+      const buffer = await this.storage.readLocalPrivateObject(doc.storageKey);
+      return { doc, buffer };
+    } catch (err: any) {
+      if (err?.code !== 'ENOENT') throw err;
+      // On serverless runtimes (e.g., Vercel /tmp), regenerate standard PDFs on-the-fly from PostgreSQL
+      const regenerated = await this.regenerateDocumentBuffer(doc);
+      if (regenerated) {
+        return { doc, buffer: regenerated };
+      }
+      throw new NotFoundException('Document file is unavailable.');
+    }
+  }
+
+  private async regenerateDocumentBuffer(doc: {
+    documentType: DocumentType;
+    entityId: string | null;
+  }): Promise<Buffer | null> {
+    if (!doc.entityId) return null;
+    const settings = await this.settingsService.getAll();
+
+    if (doc.documentType === DocumentType.SALES_INVOICE) {
+      const invoice = await this.prisma.salesInvoice.findUnique({
+        where: { id: doc.entityId },
+        include: {
+          dealer: { include: { addresses: { where: { isDefault: true }, take: 1 } } },
+          items: { include: { item: { include: { uom: true } } } },
+          allocations: { include: { payment: { select: { paymentMode: true, verificationStatus: true } } } },
+        },
+      });
+      return invoice ? this.pdfService.generateSalesInvoicePdf(invoice, settings) : null;
+    }
+
+    if (doc.documentType === DocumentType.PAYMENT_RECEIPT) {
+      const payment = await this.prisma.payment.findUnique({
+        where: { id: doc.entityId },
+        include: {
+          dealer: true,
+          allocations: { include: { invoice: { select: { invoiceNumber: true } } } },
+        },
+      });
+      return payment ? this.pdfService.generatePaymentReceiptPdf(payment, settings) : null;
+    }
+
+    if (doc.documentType === DocumentType.DELIVERY_CHALLAN) {
+      const dispatch = await this.prisma.dispatch.findUnique({
+        where: { id: doc.entityId },
+        include: {
+          order: { include: { dealer: true } },
+          sourceLocation: true,
+          items: { include: { item: { include: { uom: true } } } },
+        },
+      });
+      return dispatch ? this.pdfService.generateDeliveryChallanPdf(dispatch, settings) : null;
+    }
+
+    return null;
   }
 
   async getOrGenerateInvoicePdf(invoiceId: string, actor: AuthenticatedUser) {

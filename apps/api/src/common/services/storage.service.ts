@@ -89,7 +89,7 @@ export class StorageService {
     }
 
     // Local private storage driver (never served statically; requires HMAC-signed token)
-    const rootDir = path.resolve(this.env.STORAGE_LOCAL_DIR);
+    const rootDir = this.getLocalRootDir();
     const fullPath = path.resolve(rootDir, storageKey);
     if (!fullPath.startsWith(rootDir)) {
       throw new BadRequestException('Invalid storage path.');
@@ -103,6 +103,13 @@ export class StorageService {
       fileSizeBytes: params.buffer.length,
       checksumSha256,
     };
+  }
+
+  private getLocalRootDir(): string {
+    if (process.env.VERCEL && !path.isAbsolute(this.env.STORAGE_LOCAL_DIR)) {
+      return path.resolve('/tmp', 'erp-storage');
+    }
+    return path.resolve(this.env.STORAGE_LOCAL_DIR);
   }
 
   async createShortLivedDownloadUrl(params: {
@@ -143,7 +150,7 @@ export class StorageService {
   }
 
   async readLocalPrivateObject(storageKey: string): Promise<Buffer> {
-    const rootDir = path.resolve(this.env.STORAGE_LOCAL_DIR);
+    const rootDir = this.getLocalRootDir();
     const fullPath = path.resolve(rootDir, storageKey);
     if (!fullPath.startsWith(rootDir)) {
       throw new BadRequestException('Invalid storage path.');
