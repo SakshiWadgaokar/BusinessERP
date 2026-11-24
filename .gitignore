@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build artifacts
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+!*.env.example
+
+# Logs & Coverage
+logs/
+*.log
+npm-debug.log*
+coverage/
+
+# Local private dev storage & backups
+.local-storage/
+backups/
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

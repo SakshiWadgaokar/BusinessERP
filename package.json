@@ -1,0 +1,30 @@
+{
+  "name": "business-erp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-Grade Manufacturing & Distribution Business ERP",
+  "workspaces": [
+    "packages/shared",
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:api": "npm --workspace=@erp/api run start:dev",
+    "dev:web": "npm --workspace=@erp/web run dev",
+    "build:shared": "npm --workspace=@erp/shared run build",
+    "build:api": "npm --workspace=@erp/api run build",
+    "build:web": "npm --workspace=@erp/web run build",
+    "build": "npm run build:shared && npm run build:api && npm run build:web",
+    "prisma:generate": "npx prisma generate --schema=prisma/schema.prisma",
+    "prisma:migrate:dev": "npx prisma migrate dev --schema=prisma/schema.prisma",
+    "prisma:migrate:deploy": "npx prisma migrate deploy --schema=prisma/schema.prisma",
+    "prisma:seed": "npx tsx prisma/seed.ts",
+    "test:api": "npm --workspace=@erp/api run test",
+    "test:e2e": "npm --workspace=@erp/api run test:e2e",
+    "lint": "npm --workspace=@erp/api run lint && npm --workspace=@erp/web run lint"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  }
+}
