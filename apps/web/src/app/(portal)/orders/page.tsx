@@ -42,14 +42,16 @@ export default function OrdersAdminPage() {
     setFeedback(null);
     if (!selectedLocation) return;
     try {
-      await apiRequest(`/orders/${order.id}/approve`, {
+      const res = await apiRequest<any>(`/orders/${order.id}/approve`, {
         method: 'POST',
         body: JSON.stringify({
           sourceLocationId: selectedLocation,
           overrideCreditLimit: Boolean(order.creditLimitExceeded),
         }),
       });
-      setFeedback(`Order ${order.orderNumber} approved and stock reserved.`);
+      setFeedback(
+        `Order ${order.orderNumber} approved, stock reserved${res?.invoice ? `, payment invoice ${res.invoice.invoiceNumber} generated` : ''}, and dealer notified to pay.`,
+      );
       await load();
     } catch (err) {
       setFeedback(err instanceof ApiError ? err.message : 'Approval failed.');
@@ -101,7 +103,7 @@ export default function OrdersAdminPage() {
         <div>
           <h2 className="text-2xl font-bold text-slate-900">Dealer Order Workflow</h2>
           <p className="text-sm text-slate-600">
-            Approve dealer orders (reserves stock) and execute dispatches (deducts stock & issues invoice).
+            Approve dealer orders (reserves stock, generates payment invoice & notifies dealer) and execute dispatches.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">

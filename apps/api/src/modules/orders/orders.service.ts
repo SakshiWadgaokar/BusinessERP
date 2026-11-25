@@ -374,7 +374,10 @@ export class OrdersService {
   async approve(orderId: string, input: ApproveOrderInput, actor: AuthenticatedUser) {
     const order = await this.prisma.dealerOrder.findUnique({
       where: { id: orderId },
-      include: { dealer: { include: { creditSettings: true } }, items: true },
+      include: {
+        dealer: { include: { creditSettings: true } },
+        items: { include: { item: true } },
+      },
     });
     if (!order) throw new NotFoundException('Order not found.');
 
@@ -423,6 +426,89 @@ export class OrdersService {
         include: { items: true, reservations: true },
       });
 
+      // Automatically generate the payment Sales Invoice on approval (if not already generated)
+      let invoice = await tx.salesInvoice.findFirst({
+        where: { orderId: order.id, status: { not: InvoiceStatus.VOID } },
+        include: { items: true },
+      });
+
+      if (!invoice) {
+        const invoiceNumber = await this.sequenceService.next('INVOICE', tx);
+        const orderDiscPct = new Decimal(order.discountPercent.toString());
+        const dueDate = new Date(
+          Date.now() + (order.dealer.paymentTermsDays || 30) * 24 * 60 * 60 * 1000,
+        );
+
+        let invSubtotal = new Decimal(0);
+        let invTax = new Decimal(0);
+
+        const invoiceLines = order.items.map((oi) => {
+          const qty = new Decimal(oi.orderedQuantity.toString());
+          const unitRate = new Decimal(oi.unitRate.toString());
+          const lineGross = qty.times(unitRate).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+          const lineDisc = orderDiscPct.greaterThan(0)
+            ? lineGross.times(orderDiscPct).dividedBy(100).toDecimalPlaces(2, Decimal.ROUND_HALF_UP)
+            : new Decimal(0);
+          const lineSub = lineGross.minus(lineDisc);
+          const taxRate = new Decimal(oi.taxRate.toString());
+          const lineTax = lineSub.times(taxRate).dividedBy(100).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+          const lineTot = lineSub.plus(lineTax);
+
+          invSubtotal = invSubtotal.plus(lineSub);
+          invTax = invTax.plus(lineTax);
+
+          return {
+            itemId: oi.itemId,
+            description: order.appliedOfferCode
+              ? `${oi.item.name} (${order.appliedOfferCode} -${Number(orderDiscPct)}%)`
+              : `${oi.item.name} (${oi.item.sku})`,
+            quantity: qty.toFixed(4),
+            unitRate: unitRate.toFixed(2),
+            taxRate: taxRate.toFixed(2),
+            taxAmount: lineTax.toFixed(2),
+            lineTotal: lineTot.toFixed(2),
+            unitCost: new Decimal(oi.item.standardCost.toString()).toFixed(4),
+          };
+        });
+
+        const invTotal = invSubtotal.plus(invTax).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+
+        invoice = await tx.salesInvoice.create({
+          data: {
+            invoiceNumber,
+            dealerId: order.dealerId,
+            orderId: order.id,
+            dispatchId: null,
+            dueDate,
+            subtotal: invSubtotal.toFixed(2),
+            discountPercent: order.discountPercent,
+            discountAmount: order.discountAmount,
+            appliedOfferCode: order.appliedOfferCode,
+            taxAmount: invTax.toFixed(2),
+            totalAmount: invTotal.toFixed(2),
+            paidAmount: '0.00',
+            outstandingAmount: invTotal.toFixed(2),
+            status: InvoiceStatus.ISSUED,
+            paymentTerms: order.dealer.paymentTermsLabel ?? `Net ${order.dealer.paymentTermsDays} Days`,
+            issuedById: actor.userId,
+            notes: `Payment invoice generated on approval of order ${order.orderNumber}.`,
+            items: { create: invoiceLines },
+          },
+          include: { items: true },
+        });
+
+        await this.dealerLedger.postEntry(tx, {
+          dealerId: order.dealerId,
+          entryType: LedgerEntryType.SALES_INVOICE,
+          referenceType: 'SalesInvoice',
+          referenceId: invoice.id,
+          referenceNumber: invoice.invoiceNumber,
+          debitAmount: invTotal,
+          description: `Payment Invoice ${invoice.invoiceNumber} generated on approval of Order ${order.orderNumber}`,
+          createdById: actor.userId,
+        });
+      }
+
       await tx.approvalRecord.create({
         data: {
           entityType: 'DealerOrder',
@@ -448,29 +534,40 @@ export class OrdersService {
             status: OrderStatus.APPROVED,
             sourceLocationId: input.sourceLocationId,
             overrideCreditLimit: input.overrideCreditLimit,
+            invoiceId: invoice.id,
+            invoiceNumber: invoice.invoiceNumber,
           },
         },
         tx,
       );
 
-      return approvedOrder;
+      return { ...approvedOrder, invoice };
     });
 
+    const dueLabel = new Date(updated.invoice.dueDate).toLocaleDateString('en-IN');
     if (order.dealer.userId) {
       await this.notifications.notify({
         userIds: [order.dealer.userId],
-        roleCodes: [ROLES.INVENTORY_MANAGER],
+        roleCodes: [ROLES.INVENTORY_MANAGER, ROLES.ACCOUNTANT],
         category: 'ORDER',
-        title: `Order Approved: ${order.orderNumber}`,
-        message: `Order ${order.orderNumber} has been approved and stock has been reserved for dispatch.`,
-        entityType: 'DealerOrder',
-        entityId: order.id,
+        title: `Order Approved — Payment Invoice ${updated.invoice.invoiceNumber} Ready`,
+        message: `Order ${order.orderNumber} is approved! Payment Invoice ${updated.invoice.invoiceNumber} for ₹${updated.invoice.totalAmount.toString()} (Due ${dueLabel}) is ready. Please submit full or partial payment in My Invoices.`,
+        entityType: 'SalesInvoice',
+        entityId: updated.invoice.id,
       });
     }
     this.realtime.emitToDealer(order.dealerId, 'order.approved', {
       orderId: order.id,
       orderNumber: order.orderNumber,
+      invoiceId: updated.invoice.id,
+      invoiceNumber: updated.invoice.invoiceNumber,
+      totalAmount: updated.invoice.totalAmount.toString(),
     });
+    this.realtime.emitToRoles(
+      [ROLES.SUPER_ADMIN, ROLES.ACCOUNTANT],
+      'dashboard.refresh',
+      { reason: 'ORDER_APPROVED_INVOICED' },
+    );
 
     return updated;
   }
@@ -564,6 +661,31 @@ export class OrdersService {
             cancel: true,
           });
         }
+      }
+
+      const existingApprovalInvoice = await tx.salesInvoice.findFirst({
+        where: { orderId: order.id, status: { not: InvoiceStatus.VOID } },
+      });
+      if (existingApprovalInvoice) {
+        if (new Decimal(existingApprovalInvoice.paidAmount.toString()).greaterThan(0)) {
+          throw new BadRequestException(
+            `Cannot cancel order ${order.orderNumber} because payment has already been recorded on invoice ${existingApprovalInvoice.invoiceNumber}. Issue a Credit Note or reverse payment first.`,
+          );
+        }
+        await tx.salesInvoice.update({
+          where: { id: existingApprovalInvoice.id },
+          data: { status: InvoiceStatus.VOID, outstandingAmount: '0.00' },
+        });
+        await this.dealerLedger.postEntry(tx, {
+          dealerId: order.dealerId,
+          entryType: LedgerEntryType.CREDIT_ADJUSTMENT,
+          referenceType: 'SalesInvoice',
+          referenceId: existingApprovalInvoice.id,
+          referenceNumber: existingApprovalInvoice.invoiceNumber,
+          creditAmount: new Decimal(existingApprovalInvoice.totalAmount.toString()),
+          description: `Invoice ${existingApprovalInvoice.invoiceNumber} voided due to cancellation of Order ${order.orderNumber}`,
+          createdById: actor.userId,
+        });
       }
 
       const cancelled = await tx.dealerOrder.update({
@@ -742,9 +864,21 @@ export class OrdersService {
         data: { status: nextStatus },
       });
 
-      // Optionally generate Sales Invoice and post Dealer Ledger DEBIT atomically
-      let invoice: any = null;
-      if (input.generateInvoice) {
+      // Link existing approval invoice if already generated, or create dispatch invoice if none exists
+      let invoice: any = await tx.salesInvoice.findFirst({
+        where: { orderId: order.id, status: { not: InvoiceStatus.VOID } },
+        include: { items: true },
+      });
+
+      if (invoice) {
+        if (!invoice.dispatchId) {
+          invoice = await tx.salesInvoice.update({
+            where: { id: invoice.id },
+            data: { dispatchId: dispatch.id },
+            include: { items: true },
+          });
+        }
+      } else if (input.generateInvoice) {
         const invoiceNumber = await this.sequenceService.next('INVOICE', tx);
         const invTotal = invSubtotal.plus(invTax).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
         const dueDate = new Date(

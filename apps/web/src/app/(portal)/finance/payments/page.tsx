@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useState } from 'react';
 import { PERMISSIONS, PaymentMode, formatINR } from '@erp/shared';
-import { Download, Plus, RotateCcw } from 'lucide-react';
+import { CheckCircle2, Clock, Download, Plus, RotateCcw, XCircle } from 'lucide-react';
 import { apiRequest, ApiError } from '@/lib/api-client';
 import { useAuth } from '@/context/auth-context';
 import { Button } from '@/components/ui/button';
@@ -75,6 +75,34 @@ export default function FinancePaymentsPage() {
     }
   };
 
+  const verifyOrRejectPayment = async (p: any, action: 'VERIFY' | 'REJECT') => {
+    setFeedback(null);
+    let reason: string | undefined;
+    if (action === 'REJECT') {
+      const input = window.prompt(`Enter reason for rejecting ${p.receiptNumber} (${p.dealer.businessName}):`);
+      if (!input) return;
+      reason = input;
+    } else {
+      if (!window.confirm(`Verify receipt of ${formatINR(p.amount)} from ${p.dealer.businessName} and credit their ledger?`)) {
+        return;
+      }
+    }
+    try {
+      const res = await apiRequest<any>(`/finance/payments/${p.id}/verify`, {
+        method: 'POST',
+        body: JSON.stringify({ action, reason }),
+      });
+      setFeedback(
+        action === 'VERIFY'
+          ? `Payment ${p.receiptNumber} verified! Updated dealer balance: ${formatINR(res.dealerOutstandingAfter)}. Dealer has been notified.`
+          : `Payment submission ${p.receiptNumber} rejected and dealer notified.`,
+      );
+      await load();
+    } catch (err) {
+      setFeedback(err instanceof ApiError ? err.message : 'Action failed.');
+    }
+  };
+
   const reversePayment = async (p: any) => {
     const reason = window.prompt(`Enter audit reason to reverse ${p.receiptNumber}:`);
     if (!reason) return;
@@ -95,12 +123,16 @@ export default function FinancePaymentsPage() {
     window.open(res.url, '_blank', 'noopener,noreferrer');
   };
 
+  const pendingPayments = payments.filter((p) => p.verificationStatus === 'PENDING');
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
         <div>
           <h2 className="text-2xl font-bold text-slate-900">Payments & Receipts</h2>
-          <p className="text-sm text-slate-600">Idempotency-protected dealer payment recording, allocation, and PDF receipts.</p>
+          <p className="text-sm text-slate-600">
+            Verify dealer-submitted full/partial payments, record receipts, and issue PDFs.
+          </p>
         </div>
         {can(PERMISSIONS.PAYMENTS_RECORD) && (
           <Button onClick={() => setShowCreate(true)}><Plus className="h-4 w-4" /> Record Payment</Button>
@@ -109,8 +141,60 @@ export default function FinancePaymentsPage() {
 
       {feedback && <div className="rounded-lg bg-indigo-50 px-4 py-3 text-sm text-indigo-800">{feedback}</div>}
 
+      {/* Pending Dealer Submissions requiring Owner / Accountant Verification */}
+      {pendingPayments.length > 0 && (
+        <Card className="border-amber-300 bg-amber-50/40">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-amber-900">
+              <Clock className="h-5 w-5 text-amber-600" />
+              Pending Dealer Payment Submissions ({pendingPayments.length})
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {pendingPayments.map((p) => {
+              const isPartial = String(p.notes || '').includes('[PARTIAL PAYMENT');
+              const invoiceNos = (p.allocations || [])
+                .map((a: any) => a.invoice?.invoiceNumber)
+                .filter(Boolean)
+                .join(', ');
+              return (
+                <div
+                  key={p.id}
+                  className="flex flex-col justify-between gap-3 rounded-xl border border-amber-200 bg-white p-4 sm:flex-row sm:items-center"
+                >
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono text-xs font-bold text-slate-800">{p.receiptNumber}</span>
+                      <Badge variant={isPartial ? 'warning' : 'info'}>
+                        {isPartial ? 'PARTIAL PAYMENT' : 'FULL PAYMENT'}
+                      </Badge>
+                      {invoiceNos && <span className="font-mono text-xs text-slate-600">Invoice: {invoiceNos}</span>}
+                    </div>
+                    <p className="text-sm font-semibold text-slate-900">
+                      {p.dealer.businessName} — <span className="text-emerald-700">{formatINR(p.amount)}</span> via {p.paymentMode}
+                      {p.transactionRef ? ` (Ref: ${p.transactionRef})` : ''}
+                    </p>
+                    {p.notes && <p className="text-xs text-slate-700">{p.notes}</p>}
+                  </div>
+                  {can(PERMISSIONS.PAYMENTS_VERIFY) && (
+                    <div className="flex shrink-0 gap-2">
+                      <Button size="sm" onClick={() => verifyOrRejectPayment(p, 'VERIFY')}>
+                        <CheckCircle2 className="h-3.5 w-3.5" /> Verify & Credit
+                      </Button>
+                      <Button size="sm" variant="danger" onClick={() => verifyOrRejectPayment(p, 'REJECT')}>
+                        <XCircle className="h-3.5 w-3.5" /> Reject
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
-        <CardHeader><CardTitle>Recorded Payments ({payments.length})</CardTitle></CardHeader>
+        <CardHeader><CardTitle>All Payments ({payments.length})</CardTitle></CardHeader>
         <CardContent className="p-0">
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
@@ -118,7 +202,7 @@ export default function FinancePaymentsPage() {
                 <tr>
                   <th className="px-5 py-3">Receipt / Payment No</th>
                   <th className="px-5 py-3">Dealer</th>
-                  <th className="px-5 py-3">Mode / Ref</th>
+                  <th className="px-5 py-3">Mode / Statement</th>
                   <th className="px-5 py-3 text-right">Amount</th>
                   <th className="px-5 py-3">Status</th>
                   <th className="px-5 py-3 text-right">Actions</th>
@@ -132,22 +216,51 @@ export default function FinancePaymentsPage() {
                       <p className="text-xs text-slate-500">{new Date(p.paymentDate).toLocaleDateString('en-IN')}</p>
                     </td>
                     <td className="px-5 py-3.5 font-medium">{p.dealer.businessName}</td>
-                    <td className="px-5 py-3.5 text-xs">{p.paymentMode} {p.transactionRef ? `• ${p.transactionRef}` : ''}</td>
+                    <td className="px-5 py-3.5 text-xs">
+                      <p className="font-medium text-slate-800">
+                        {p.paymentMode} {p.transactionRef ? `• ${p.transactionRef}` : ''}
+                      </p>
+                      {p.notes && <p className="mt-0.5 max-w-md text-[11px] text-slate-600">{p.notes}</p>}
+                      {p.reversalReason && (
+                        <p className="mt-0.5 text-[11px] font-medium text-red-600">{p.reversalReason}</p>
+                      )}
+                    </td>
                     <td className="px-5 py-3.5 text-right font-semibold text-emerald-700">{formatINR(p.amount)}</td>
                     <td className="px-5 py-3.5">
-                      <Badge variant={p.verificationStatus === 'REVERSED' ? 'danger' : 'success'}>
+                      <Badge
+                        variant={
+                          p.verificationStatus === 'VERIFIED'
+                            ? 'success'
+                            : p.verificationStatus === 'PENDING'
+                              ? 'warning'
+                              : 'danger'
+                        }
+                      >
                         {p.verificationStatus}
                       </Badge>
                     </td>
                     <td className="px-5 py-3.5 text-right">
                       <div className="flex justify-end gap-1.5">
-                        <Button size="sm" variant="outline" onClick={() => downloadReceipt(p.id)}>
-                          <Download className="h-3.5 w-3.5" /> Receipt
-                        </Button>
-                        {can(PERMISSIONS.PAYMENTS_REVERSE) && p.verificationStatus !== 'REVERSED' && (
-                          <Button size="sm" variant="danger" onClick={() => reversePayment(p)}>
-                            <RotateCcw className="h-3.5 w-3.5" /> Reverse
-                          </Button>
+                        {p.verificationStatus === 'PENDING' && can(PERMISSIONS.PAYMENTS_VERIFY) ? (
+                          <>
+                            <Button size="sm" onClick={() => verifyOrRejectPayment(p, 'VERIFY')}>
+                              <CheckCircle2 className="h-3.5 w-3.5" /> Verify
+                            </Button>
+                            <Button size="sm" variant="danger" onClick={() => verifyOrRejectPayment(p, 'REJECT')}>
+                              <XCircle className="h-3.5 w-3.5" /> Reject
+                            </Button>
+                          </>
+                        ) : (
+                          <>
+                            <Button size="sm" variant="outline" onClick={() => downloadReceipt(p.id)}>
+                              <Download className="h-3.5 w-3.5" /> Receipt
+                            </Button>
+                            {can(PERMISSIONS.PAYMENTS_REVERSE) && p.verificationStatus === 'VERIFIED' && (
+                              <Button size="sm" variant="danger" onClick={() => reversePayment(p)}>
+                                <RotateCcw className="h-3.5 w-3.5" /> Reverse
+                              </Button>
+                            )}
+                          </>
                         )}
                       </div>
                     </td>

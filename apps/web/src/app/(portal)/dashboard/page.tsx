@@ -85,6 +85,7 @@ export default function DashboardPage() {
   const [range, setRange] = useState('this_month');
   const [adminData, setAdminData] = useState<any>(null);
   const [dealerSummary, setDealerSummary] = useState<any>(null);
+  const [dealerDueInvoices, setDealerDueInvoices] = useState<any[]>([]);
   const [activeOffers, setActiveOffers] = useState<any[]>([]);
   const [empSummary, setEmpSummary] = useState<any>(null);
   const [financeSummary, setFinanceSummary] = useState<any>(null);
@@ -99,12 +100,18 @@ export default function DashboardPage() {
         const res = await apiRequest(`/analytics/dashboard?range=${range}`);
         setAdminData(res);
       } else if (primaryRole === ROLES.DEALER) {
-        const [res, offersRes] = await Promise.all([
+        const [res, offersRes, invRes] = await Promise.all([
           apiRequest('/dealers/me/summary'),
           apiRequest<any[]>('/offers/active').catch(() => []),
+          apiRequest<{ data: any[] }>('/finance/invoices?limit=20').catch(() => ({ data: [] })),
         ]);
         setDealerSummary(res);
         setActiveOffers(offersRes);
+        setDealerDueInvoices(
+          (invRes.data || []).filter(
+            (i) => i.status !== 'PAID' && i.status !== 'VOID' && Number(i.outstandingAmount) > 0,
+          ),
+        );
       } else if (primaryRole === ROLES.EMPLOYEE) {
         const res = await apiRequest('/employees/me/dashboard');
         setEmpSummary(res);
@@ -148,6 +155,40 @@ export default function DashboardPage() {
             </Button>
           </Link>
         </div>
+
+        {/* Action Required: Approved Invoices Awaiting Full or Partial Payment */}
+        {dealerDueInvoices.length > 0 && (
+          <div className="space-y-2.5">
+            {dealerDueInvoices.slice(0, 3).map((inv) => (
+              <div
+                key={inv.id}
+                className="flex flex-col justify-between gap-3 rounded-xl border border-indigo-200 bg-indigo-50/80 p-4 shadow-sm sm:flex-row sm:items-center"
+              >
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="info">Payment Requested</Badge>
+                    <span className="font-mono text-xs font-bold text-slate-800">{inv.invoiceNumber}</span>
+                    <Badge variant="warning">{inv.status}</Badge>
+                  </div>
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                    Amount Due: {formatINR(inv.outstandingAmount)}{' '}
+                    <span className="font-normal text-slate-600">
+                      (Total {formatINR(inv.totalAmount)} • Due {new Date(inv.dueDate).toLocaleDateString('en-IN')})
+                    </span>
+                  </p>
+                  <p className="text-xs text-slate-600">
+                    Your order is approved. Submit full payment or declare a partial payment with your balance plan.
+                  </p>
+                </div>
+                <Link href={`/dealer/invoices?pay=${inv.id}`} className="shrink-0">
+                  <Button size="sm">
+                    <CreditCard className="h-3.5 w-3.5" /> Pay / Declare Partial
+                  </Button>
+                </Link>
+              </div>
+            ))}
+          </div>
+        )}
 
         {/* Active Festive / Promotional Offers announced by Owner */}
         {activeOffers.length > 0 && (

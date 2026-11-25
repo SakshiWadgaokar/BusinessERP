@@ -27,7 +27,9 @@ export default function DealerPaymentsPage() {
     <div className="space-y-6">
       <div>
         <h2 className="text-2xl font-bold text-slate-900">My Payments & Receipts</h2>
-        <p className="text-sm text-slate-600">All verified payments recorded against your account.</p>
+        <p className="text-sm text-slate-600">
+          Track submitted full/partial payments, verification status, and official receipts.
+        </p>
       </div>
       <Card>
         <CardHeader><CardTitle>Payment History ({payments.length})</CardTitle></CardHeader>
@@ -38,7 +40,7 @@ export default function DealerPaymentsPage() {
                 <tr>
                   <th className="px-5 py-3">Receipt No</th>
                   <th className="px-5 py-3">Date</th>
-                  <th className="px-5 py-3">Mode / Ref</th>
+                  <th className="px-5 py-3">Mode / Statement</th>
                   <th className="px-5 py-3 text-right">Amount</th>
                   <th className="px-5 py-3">Status</th>
                   <th className="px-5 py-3 text-right">Receipt</th>
@@ -54,13 +56,39 @@ export default function DealerPaymentsPage() {
                     <tr key={p.id}>
                       <td className="px-5 py-3.5 font-mono font-semibold">{p.receiptNumber}</td>
                       <td className="px-5 py-3.5 text-xs">{new Date(p.paymentDate).toLocaleDateString('en-IN')}</td>
-                      <td className="px-5 py-3.5 text-xs">{p.paymentMode} {p.transactionRef ? `• ${p.transactionRef}` : ''}</td>
+                      <td className="px-5 py-3.5 text-xs">
+                        <p className="font-medium text-slate-800">
+                          {p.paymentMode} {p.transactionRef ? `• ${p.transactionRef}` : ''}
+                        </p>
+                        {p.notes && <p className="mt-0.5 text-[11px] text-slate-600">{p.notes}</p>}
+                        {p.reversalReason && (
+                          <p className="mt-0.5 text-[11px] font-medium text-red-600">{p.reversalReason}</p>
+                        )}
+                      </td>
                       <td className="px-5 py-3.5 text-right font-semibold text-emerald-700">{formatINR(p.amount)}</td>
-                      <td className="px-5 py-3.5"><Badge variant={p.verificationStatus === 'REVERSED' ? 'danger' : 'success'}>{p.verificationStatus}</Badge></td>
+                      <td className="px-5 py-3.5">
+                        <Badge
+                          variant={
+                            p.verificationStatus === 'VERIFIED'
+                              ? 'success'
+                              : p.verificationStatus === 'PENDING'
+                                ? 'warning'
+                                : 'danger'
+                          }
+                        >
+                          {p.verificationStatus === 'PENDING' ? 'AWAITING VERIFICATION' : p.verificationStatus}
+                        </Badge>
+                      </td>
                       <td className="px-5 py-3.5 text-right">
-                        <Button size="sm" variant="outline" onClick={() => downloadReceipt(p.id)}>
-                          <Download className="h-3.5 w-3.5" /> Receipt
-                        </Button>
+                        {p.verificationStatus === 'VERIFIED' ? (
+                          <Button size="sm" variant="outline" onClick={() => downloadReceipt(p.id)}>
+                            <Download className="h-3.5 w-3.5" /> Receipt
+                          </Button>
+                        ) : (
+                          <span className="text-xs text-slate-400">
+                            {p.verificationStatus === 'PENDING' ? 'Pending approval' : '—'}
+                          </span>
+                        )}
                       </td>
                     </tr>
                   ))

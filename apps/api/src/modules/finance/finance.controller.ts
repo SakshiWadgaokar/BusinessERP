@@ -3,9 +3,11 @@ import {
   PERMISSIONS,
   createCreditNoteSchema,
   createExpenseSchema,
+  dealerSubmitPaymentSchema,
   paginationQuerySchema,
   recordPaymentSchema,
   reversePaymentSchema,
+  verifyPaymentDecisionSchema,
 } from '@erp/shared';
 import { z } from 'zod';
 import {
@@ -75,6 +77,26 @@ export class FinanceController {
     @CurrentUser() actor: AuthenticatedUser,
   ) {
     return this.financeService.recordPayment(body, actor);
+  }
+
+  @Post('payments/dealer-submit')
+  @RequirePermissions(PERMISSIONS.PAYMENTS_READ)
+  @RequireIdempotency()
+  dealerSubmitPayment(
+    @Body(new ZodValidationPipe(dealerSubmitPaymentSchema)) body: any,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.financeService.dealerSubmitPayment(body, actor);
+  }
+
+  @Post('payments/:id/verify')
+  @RequirePermissions(PERMISSIONS.PAYMENTS_VERIFY)
+  verifyDealerPayment(
+    @Param('id') id: string,
+    @Body(new ZodValidationPipe(verifyPaymentDecisionSchema)) body: { action: 'VERIFY' | 'REJECT'; reason?: string | null },
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.financeService.verifyDealerPayment(id, body, actor);
   }
 
   @Post('payments/:id/reverse')

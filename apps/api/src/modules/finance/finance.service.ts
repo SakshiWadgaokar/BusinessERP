@@ -352,6 +352,322 @@ export class FinanceService {
   }
 
   /**
+   * Allows a dealer to declare a full or partial payment against one of their open invoices.
+   * Creates a PENDING payment submission for Owner / Accountant verification without prematurely
+   * crediting the ledger. If paying partially, the dealer MUST state a partial payment reason.
+   */
+  async dealerSubmitPayment(
+    input: {
+      invoiceId: string;
+      paymentType: 'FULL' | 'PARTIAL';
+      amount: string;
+      paymentMode: any;
+      transactionRef?: string | null;
+      partialPaymentReason?: string | null;
+      expectedBalanceDate?: string | null;
+      notes?: string | null;
+    },
+    actor: AuthenticatedUser,
+  ) {
+    if (!actor.dealerId) {
+      throw new ForbiddenException('Only dealer accounts can submit dealer payments.');
+    }
+
+    const amount = new Decimal(input.amount).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+    if (amount.lessThanOrEqualTo(0)) {
+      throw new BadRequestException('Payment amount must be greater than zero.');
+    }
+
+    const invoice = await this.prisma.salesInvoice.findUnique({
+      where: { id: input.invoiceId },
+      include: { dealer: true },
+    });
+    if (!invoice || invoice.dealerId !== actor.dealerId) {
+      throw new NotFoundException('Invoice not found for your account.');
+    }
+    if (invoice.status === InvoiceStatus.VOID) {
+      throw new BadRequestException(`Invoice ${invoice.invoiceNumber} is void.`);
+    }
+
+    const currentOutstanding = new Decimal(invoice.outstandingAmount.toString()).toDecimalPlaces(2);
+    if (currentOutstanding.lessThanOrEqualTo(0)) {
+      throw new BadRequestException(`Invoice ${invoice.invoiceNumber} is already fully paid.`);
+    }
+    if (amount.greaterThan(currentOutstanding)) {
+      throw new BadRequestException(
+        `Amount (₹${amount.toFixed(2)}) exceeds outstanding balance (₹${currentOutstanding.toFixed(2)}) on ${invoice.invoiceNumber}.`,
+      );
+    }
+
+    const isPartial = input.paymentType === 'PARTIAL' || amount.lessThan(currentOutstanding);
+    const partialReason = (input.partialPaymentReason || '').trim();
+    if (isPartial && partialReason.length < 5) {
+      throw new BadRequestException(
+        'Because this is a partial payment, please state your partial payment reason / balance commitment (at least 5 characters).',
+      );
+    }
+
+    const remainingAfter = currentOutstanding.minus(amount).toDecimalPlaces(2);
+    const expectedDate = (input.expectedBalanceDate || '').trim();
+    const extraNotes = (input.notes || '').trim();
+
+    const structuredNotes = isPartial
+      ? `[PARTIAL PAYMENT | Paying ₹${amount.toFixed(2)} of ₹${currentOutstanding.toFixed(2)} | Balance Remaining: ₹${remainingAfter.toFixed(2)}${expectedDate ? ` | Expected Balance Date: ${expectedDate}` : ''}] Statement: ${partialReason}${extraNotes ? ` | Remarks: ${extraNotes}` : ''}`
+      : `[FULL PAYMENT | ₹${amount.toFixed(2)} against ${invoice.invoiceNumber}]${extraNotes ? ` Remarks: ${extraNotes}` : ''}`;
+
+    const payment = await this.prisma.runInTransaction(async (tx) => {
+      const paymentNumber = await this.sequenceService.next('PAYMENT', tx);
+      const receiptNumber = await this.sequenceService.next('RECEIPT', tx);
+
+      const created = await tx.payment.create({
+        data: {
+          paymentNumber,
+          receiptNumber,
+          dealerId: invoice.dealerId,
+          paymentDate: new Date(),
+          amount: amount.toFixed(2),
+          unallocatedAmount: '0.00',
+          paymentMode: input.paymentMode,
+          transactionRef: input.transactionRef?.trim() || null,
+          verificationStatus: PaymentVerificationStatus.PENDING,
+          recordedById: actor.userId,
+          notes: structuredNotes,
+          allocations: {
+            create: {
+              invoiceId: invoice.id,
+              allocatedAmount: amount.toFixed(2),
+            },
+          },
+        },
+        include: {
+          dealer: { select: { id: true, dealerCode: true, businessName: true } },
+          allocations: { include: { invoice: { select: { id: true, invoiceNumber: true } } } },
+        },
+      });
+
+      await this.auditService.record(
+        {
+          actorUserId: actor.userId,
+          actorEmail: actor.email,
+          action: 'DEALER_PAYMENT_SUBMITTED',
+          entityType: 'Payment',
+          entityId: created.id,
+          referenceNo: receiptNumber,
+          afterValue: {
+            invoiceNumber: invoice.invoiceNumber,
+            paymentType: isPartial ? 'PARTIAL' : 'FULL',
+            amount: amount.toFixed(2),
+            remainingAfter: remainingAfter.toFixed(2),
+            paymentMode: input.paymentMode,
+            transactionRef: created.transactionRef,
+            partialReason: isPartial ? partialReason : null,
+            expectedBalanceDate: expectedDate || null,
+          },
+        },
+        tx,
+      );
+
+      return created;
+    });
+
+    await this.notifications.notify({
+      roleCodes: [ROLES.SUPER_ADMIN, ROLES.ACCOUNTANT],
+      category: 'PAYMENT',
+      title: isPartial
+        ? `Partial Payment Submitted (Verify): ₹${amount.toFixed(2)} — ${invoice.invoiceNumber}`
+        : `Full Payment Submitted (Verify): ₹${amount.toFixed(2)} — ${invoice.invoiceNumber}`,
+      message: isPartial
+        ? `${invoice.dealer.businessName} submitted a PARTIAL payment of ₹${amount.toFixed(2)} via ${input.paymentMode}${payment.transactionRef ? ` (Ref: ${payment.transactionRef})` : ''} against ${invoice.invoiceNumber} (Remaining: ₹${remainingAfter.toFixed(2)}). Dealer statement: "${partialReason}"${expectedDate ? ` (Expected balance date: ${expectedDate})` : ''}.`
+        : `${invoice.dealer.businessName} submitted FULL payment of ₹${amount.toFixed(2)} via ${input.paymentMode}${payment.transactionRef ? ` (Ref: ${payment.transactionRef})` : ''} against ${invoice.invoiceNumber}. Please verify in Finance → Payments.`,
+      entityType: 'Payment',
+      entityId: payment.id,
+    });
+
+    this.realtime.emitToRoles(
+      [ROLES.SUPER_ADMIN, ROLES.ACCOUNTANT],
+      'payment.submitted',
+      {
+        paymentId: payment.id,
+        invoiceNumber: invoice.invoiceNumber,
+        isPartial,
+        amount: amount.toFixed(2),
+      },
+    );
+
+    return {
+      payment,
+      isPartial,
+      remainingAfter: remainingAfter.toFixed(2),
+    };
+  }
+
+  /**
+   * Owner / Accountant verifies (credits ledger & updates invoice) or rejects a PENDING dealer payment submission.
+   */
+  async verifyDealerPayment(
+    paymentId: string,
+    input: { action: 'VERIFY' | 'REJECT'; reason?: string | null },
+    actor: AuthenticatedUser,
+  ) {
+    const payment = await this.prisma.payment.findUnique({
+      where: { id: paymentId },
+      include: {
+        dealer: true,
+        allocations: { include: { invoice: true } },
+      },
+    });
+    if (!payment) throw new NotFoundException('Payment not found.');
+    if (payment.verificationStatus !== PaymentVerificationStatus.PENDING) {
+      throw new BadRequestException(`Only PENDING payments can be verified or rejected (current: ${payment.verificationStatus}).`);
+    }
+
+    if (input.action === 'REJECT') {
+      const reason = (input.reason || '').trim();
+      if (reason.length < 3) {
+        throw new BadRequestException('Please provide a reason when rejecting a payment submission.');
+      }
+
+      const rejected = await this.prisma.runInTransaction(async (tx) => {
+        const updated = await tx.payment.update({
+          where: { id: paymentId },
+          data: {
+            verificationStatus: PaymentVerificationStatus.REVERSED,
+            reversedById: actor.userId,
+            reversedAt: new Date(),
+            reversalReason: `REJECTED: ${reason}`,
+          },
+        });
+
+        await this.auditService.record(
+          {
+            actorUserId: actor.userId,
+            actorEmail: actor.email,
+            action: 'PAYMENT_SUBMISSION_REJECTED',
+            entityType: 'Payment',
+            entityId: paymentId,
+            referenceNo: payment.receiptNumber,
+            afterValue: { reason },
+          },
+          tx,
+        );
+
+        return updated;
+      });
+
+      if (payment.dealer.userId) {
+        await this.notifications.notify({
+          userIds: [payment.dealer.userId],
+          category: 'PAYMENT',
+          title: `Payment Submission Rejected: ${payment.receiptNumber}`,
+          message: `Your payment submission of ₹${new Decimal(payment.amount.toString()).toFixed(2)} was rejected. Reason: ${reason}. Please review and resubmit in My Invoices.`,
+          entityType: 'Payment',
+          entityId: payment.id,
+        });
+      }
+
+      return { payment: rejected, status: 'REJECTED' };
+    }
+
+    // VERIFY: apply allocations to invoices and post Dealer Ledger CREDIT atomically
+    const amount = new Decimal(payment.amount.toString()).toDecimalPlaces(2);
+
+    const verifiedResult = await this.prisma.runInTransaction(async (tx) => {
+      for (const alloc of payment.allocations) {
+        const inv = await tx.salesInvoice.findUniqueOrThrow({ where: { id: alloc.invoiceId } });
+        if (inv.status === InvoiceStatus.VOID) {
+          throw new BadRequestException(`Cannot verify payment against void invoice ${inv.invoiceNumber}.`);
+        }
+        const allocAmt = new Decimal(alloc.allocatedAmount.toString()).toDecimalPlaces(2);
+        const currentOut = new Decimal(inv.outstandingAmount.toString()).toDecimalPlaces(2);
+        if (allocAmt.greaterThan(currentOut)) {
+          throw new BadRequestException(
+            `Allocated amount (₹${allocAmt.toFixed(2)}) exceeds current outstanding balance (₹${currentOut.toFixed(2)}) on ${inv.invoiceNumber}.`,
+          );
+        }
+
+        const nextPaid = new Decimal(inv.paidAmount.toString()).plus(allocAmt).toDecimalPlaces(2);
+        const nextOut = currentOut.minus(allocAmt).toDecimalPlaces(2);
+        const nextStatus = nextOut.isZero() ? InvoiceStatus.PAID : InvoiceStatus.PARTIALLY_PAID;
+
+        await tx.salesInvoice.update({
+          where: { id: inv.id },
+          data: {
+            paidAmount: nextPaid.toFixed(2),
+            outstandingAmount: nextOut.toFixed(2),
+            status: nextStatus,
+          },
+        });
+      }
+
+      const updatedPayment = await tx.payment.update({
+        where: { id: paymentId },
+        data: {
+          verificationStatus: PaymentVerificationStatus.VERIFIED,
+          verifiedById: actor.userId,
+          verifiedAt: new Date(),
+        },
+      });
+
+      const ledgerPost = await this.dealerLedger.postEntry(tx, {
+        dealerId: payment.dealerId,
+        entryType: LedgerEntryType.PAYMENT,
+        entryDate: payment.paymentDate,
+        referenceType: 'Payment',
+        referenceId: payment.id,
+        referenceNumber: payment.receiptNumber,
+        creditAmount: amount,
+        description: `Verified dealer payment via ${payment.paymentMode}${payment.transactionRef ? ` (Ref: ${payment.transactionRef})` : ''} — Receipt ${payment.receiptNumber}`,
+        createdById: actor.userId,
+      });
+
+      await this.auditService.record(
+        {
+          actorUserId: actor.userId,
+          actorEmail: actor.email,
+          action: 'PAYMENT_VERIFIED',
+          entityType: 'Payment',
+          entityId: payment.id,
+          referenceNo: payment.receiptNumber,
+          afterValue: {
+            dealerId: payment.dealerId,
+            amount: amount.toFixed(2),
+            dealerBalanceAfter: ledgerPost.runningBalance.toFixed(2),
+          },
+        },
+        tx,
+      );
+
+      return {
+        payment: updatedPayment,
+        dealerOutstandingAfter: ledgerPost.runningBalance.toFixed(2),
+      };
+    });
+
+    if (payment.dealer.userId) {
+      await this.notifications.notify({
+        userIds: [payment.dealer.userId],
+        category: 'PAYMENT',
+        title: `Payment Verified: ₹${amount.toFixed(2)} — Receipt ${payment.receiptNumber}`,
+        message: `Your payment of ₹${amount.toFixed(2)} has been verified. Receipt ${payment.receiptNumber} is now ready to download. Updated account balance: ₹${verifiedResult.dealerOutstandingAfter}.`,
+        entityType: 'Payment',
+        entityId: payment.id,
+      });
+    }
+    this.realtime.emitToDealer(payment.dealerId, 'payment.verified', {
+      paymentId: payment.id,
+      receiptNumber: payment.receiptNumber,
+      outstandingBalance: verifiedResult.dealerOutstandingAfter,
+    });
+    this.realtime.emitToRoles(
+      [ROLES.SUPER_ADMIN, ROLES.ACCOUNTANT],
+      'dashboard.refresh',
+      { reason: 'PAYMENT_VERIFIED' },
+    );
+
+    return verifiedResult;
+  }
+
+  /**
    * Reverses a historical payment without deleting or modifying original ledger entries.
    */
   async reversePayment(paymentId: string, reason: string, actor: AuthenticatedUser) {
@@ -360,6 +676,9 @@ export class FinanceService {
       include: { allocations: { include: { invoice: true } } },
     });
     if (!payment) throw new NotFoundException('Payment not found.');
+    if (payment.verificationStatus === PaymentVerificationStatus.PENDING) {
+      throw new BadRequestException('Pending payment submissions should be rejected rather than reversed.');
+    }
     if (payment.verificationStatus === PaymentVerificationStatus.REVERSED) {
       throw new BadRequestException('Payment has already been reversed.');
     }
